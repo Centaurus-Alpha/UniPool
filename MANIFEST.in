@@ -1,0 +1,8 @@
+include LICENSE
+include NOTICE
+include README.md
+include README_MEGATRON.md
+include megatron/core/requirements.txt
+include megatron/core/README.md
+include megatron/core/package_info.py
+recursive-include requirements *

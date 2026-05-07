@@ -1,0 +1,25 @@
+__pycache__
+*.so
+build
+.coverage_*
+*.egg-info
+*~
+slurm*
+logs
+.vscode
+local/
+.gitmodules
+wandb/
+onelogger.log
+onelogger.err
+.venv
+runs/
+/test_cases/
+new_logs
+**/dist/
+
+# Sphinx documentation
+docs/_build
+docs/apidocs
+.DS_Store
+.ipynb_checkpoints/

@@ -1,0 +1,31 @@
+name: quick-checks
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  release-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install CPU dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch numpy packaging
+      - name: Run UniPool release checks
+        run: python tests/test_unipool_release_checks.py
+      - name: Check shell syntax
+        run: find scripts -maxdepth 1 -name "*.sh" -exec bash -n {} \;
+      - name: Compile UniPool touched files
+        run: |
+          PYTHONPYCACHEPREFIX=/tmp/unipool_pycache python -m py_compile \
+            megatron/core/transformer/moe/moe_layer.py \
+            megatron/core/transformer/moe/moe_utils.py \
+            megatron/core/transformer/moe/router.py \
+            megatron/core/transformer/transformer_block.py \
+            megatron/training/arguments.py \
+            megatron/training/checkpointing.py

@@ -1,0 +1,10 @@
+UniPool Notice
+==============
+
+UniPool is a research code release built as a derivative of NVIDIA Megatron-LM
+and Megatron Core. Upstream Megatron copyright notices and license terms are
+retained in the relevant source files and in LICENSE.
+
+This release adds shared expert-pool MoE functionality, reproduction scripts,
+and release documentation for the UniPool experiments. Unless otherwise noted,
+UniPool-specific modifications follow the license terms in LICENSE.
