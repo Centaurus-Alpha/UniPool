@@ -1,51 +1,52 @@
 # UniPool
 
+![UniPool overview](assets/overview.png)
+
 UniPool is a research code release for shared expert-pool Mixture-of-Experts
 (MoE) training on top of Megatron-LM/Megatron Core. It adds a mode where MoE
 layers keep separate routers while sharing a global or grouped expert pool.
 
-This repository is a derivative of NVIDIA Megatron-LM. The original upstream
-README is preserved as [README_MEGATRON.md](README_MEGATRON.md); this README
-documents the UniPool-specific entry points and reproduction scripts.
+This repository is a derivative of NVIDIA Megatron-LM. The training and
+evaluation setup (Pile preprocessing, LLaMA-architecture baselines at the
+182M–978M scale) follows the protocol used by
+[ReMoE](https://github.com/thu-ml/ReMoE), reusing its data pipeline so
+results are directly comparable. The original upstream Megatron README is
+preserved as [README_MEGATRON.md](README_MEGATRON.md).
 
-## Scope
+## What is UniPool?
 
-The supported UniPool surface is the expert-pool implementation and the
-training scripts under `scripts/train_llama_*_moe_UniPool.sh`. Some
-additional experimental MoE/MoD files from the research fork are retained for
-compatibility with the Megatron module graph, but they are not required for the
-UniPool experiments documented here.
+UniPool ("Unified Expert Pool") is a Mixture-of-Experts architecture that
+replaces the standard per-layer expert ownership with a single **globally
+shared expert pool**. In a vanilla MoE transformer, each of the L layers
+maintains its own private set of E expert FFNs, hard-coding a linear
+relationship between depth and total expert parameters. UniPool removes this
+constraint: all L layers route into one shared pool of M experts, while each
+layer keeps its own independent router. Any expert can be selected by any
+depth, so capacity is reused across layers instead of duplicated.
 
-## What Changed
+Two components make shared-pool training stable:
 
-UniPool adds a generalized expert-pool mode for MoE layers. The paper-facing
-configuration uses:
+- **Pool-level auxiliary loss.** Load balancing is computed by aggregating
+  token-to-expert assignments over the *whole pool* rather than per layer.
+  This prevents globally dead experts without forcing every layer to use
+  every expert, which would destroy layer-specific specialization.
+- **NormRouter.** An L2-normalize → ReLU gating function with a learnable
+  scale, used in place of softmax. It keeps routing scores sparse and
+  scale-stable when many per-layer routers compete over the same large pool.
 
-- `--moe-expert-pool-mode hyper`: each MoE layer has its own router while
-  sharing a global or grouped expert pool.
-- `--moe-expert-pool-size`: optional group size. Empty/default means one global
-  pool across all MoE layers; a positive value groups adjacent MoE layers.
-- `--moe-pool-aux-loss-coeff`: pool-level load balancing across all layers that
-  share a pool.
-- `--moe-norm-routing`: normalized routing used by the default UniPool scripts.
+Across five LLaMA-architecture active-parameter scales (182M / 469M / 650M /
+830M / 978M) trained on 30B tokens of the Pile, UniPool improves validation
+loss over matched vanilla MoE by up to 0.0386, and reduced-pool variants
+using only 41.6%–66.7% of the vanilla expert-parameter budget match or
+outperform layer-wise MoE — pool size becomes an explicit, sublinear
+depth-scaling knob.
 
-Core implementation files:
+## Installation
 
-- `megatron/core/transformer/moe/moe_layer.py`
-- `megatron/core/transformer/moe/moe_utils.py`
-- `megatron/core/transformer/moe/router.py`
-- `megatron/core/transformer/transformer_block.py`
-- `megatron/core/transformer/transformer_config.py`
-- `megatron/training/arguments.py`
-- `megatron/training/checkpointing.py`
-
-## Environment
-
-Use the same dependency stack as Megatron-LM/Megatron Core. For GPU training,
-the recommended route is an NVIDIA PyTorch/NGC container with PyTorch, CUDA,
-NCCL, Transformer Engine, and Triton installed. See
-[README_MEGATRON.md](README_MEGATRON.md) for the full upstream installation
-notes.
+UniPool shares the same dependency stack as Megatron-LM/Megatron Core. The
+recommended route is an NVIDIA PyTorch/NGC container with PyTorch, CUDA,
+NCCL, Transformer Engine, and Triton installed; see
+[README_MEGATRON.md](README_MEGATRON.md) for the full upstream notes.
 
 From the repository root:
 
@@ -53,143 +54,78 @@ From the repository root:
 pip install --no-build-isolation -e ".[mlm,dev]"
 ```
 
-The distribution package name is `unipool-megatron` to avoid confusion with the
-upstream `megatron-core` package. The Python import path remains `megatron`
-because this is a Megatron fork.
+The distribution package name is `unipool-megatron`. The Python import path
+remains `megatron` because this is a Megatron fork.
 
-The scripts also use these runtime variables when present:
+## Usage
 
-- `MASTER_ADDR`, default `localhost`
-- `MASTER_PORT`, default `6000`
-- `SLURM_NNODES`, mapped to `NNODES`
-- `RANK`, mapped to `NODE_RANK`
-- `WANDB_API_KEY`, enables W&B logging when set
+The UniPool routing/expert-pool surface is enabled with these flags (see
+`scripts/train_llama_*_moe_UniPool.sh` for full configurations):
 
-## Data Preprocessing
+- `--moe-expert-pool-mode hyper` — each MoE layer gets its own router while
+  sharing a global or grouped expert pool.
+- `--moe-expert-pool-size <N>` — group size. Empty means one global pool
+  across all layers; positive `N` groups every `N` adjacent layers into one
+  pool.
+- `--moe-pool-aux-loss-coeff <coeff>` — pool-level load balancing across all
+  layers that share a pool.
+- `--moe-norm-routing` — NormRouter (default in UniPool scripts).
 
-The Pile dataset is not bundled with this code release. Download the raw shards
-from the public Hugging Face mirror
-[`monology/pile-uncopyrighted`](https://huggingface.co/datasets/monology/pile-uncopyrighted)
-and place them under `../pile/` as `00.jsonl ... 29.jsonl` before running
-preprocessing. Any equivalent local copy of The Pile in JSONL form works.
+Core implementation lives in `megatron/core/transformer/moe/{moe_layer,
+moe_utils,router}.py` and `megatron/training/{arguments,checkpointing}.py`.
 
-Training uses Megatron indexed dataset prefixes, not raw `.jsonl` files. A
-prefix such as `../pile_gpt_test/00_text_document` must correspond to
-`../pile_gpt_test/00_text_document.bin` and
-`../pile_gpt_test/00_text_document.idx`.
+## Reproducing the Results
 
-Prepare Pile shards with the standard Megatron preprocessing command, also
-provided as `data_preprocessing.sh`:
+1. **Data preprocessing.** Download the Pile from
+   [`monology/pile-uncopyrighted`](https://huggingface.co/datasets/monology/pile-uncopyrighted)
+   and place shards at `../pile/{00..29}.jsonl`, then run:
 
-```bash
-for i in $(seq -w 0 29); do
-  python tools/preprocess_data.py \
-    --input ../pile/${i}.jsonl \
-    --output-prefix ../pile_gpt_test/${i} \
-    --vocab-file ./gpt2-vocab.json \
-    --tokenizer-type GPT2BPETokenizer \
-    --merge-file ./gpt2-merges.txt \
-    --append-eod \
-    --workers 32
-done
-```
+   ```bash
+   bash data_preprocessing.sh
+   ```
 
-The training scripts source `scripts/common_data.sh`. Defaults:
+   This writes Megatron indexed datasets to `../pile_gpt_test/`. The data
+   pipeline matches ReMoE's. Override paths via `INPUT_DIR`, `OUTPUT_DIR`,
+   `VOCAB_FILE`, `MERGE_FILE` env vars if your layout differs.
 
-- `DATA_ROOT=../pile_gpt_test`
-- `DATA_START=0`
-- `DATA_END=29`
-- `VOCAB_FILE=./gpt2-vocab.json`
-- `MERGE_FILE=./gpt2-merges.txt`
+2. **Training.** UniPool shared-pool runs:
 
-Override these if your data is elsewhere:
+   ```bash
+   bash scripts/train_llama_<size>_moe_UniPool.sh
+   #   size in {182m, 469m, 650m, 830m, 978m}
+   ```
 
-```bash
-DATA_ROOT=/path/to/pile_gpt_test \
-VOCAB_FILE=/path/to/gpt2-vocab.json \
-MERGE_FILE=/path/to/gpt2-merges.txt \
-bash scripts/train_llama_182m_moe_UniPool.sh
-```
+   Full script signature:
 
-## Training Scripts
+   ```text
+   bash scripts/train_llama_<size>_moe_UniPool.sh \
+     [gpus_per_node] [train_iters] [micro_batch_size] [num_experts] \
+     [norm_routing] [layer_aux_coeff] [pool_aux_coeff] [pool_size] \
+     [project_name] [save_interval] [save_retain_interval] [num_layers] [top_k]
+   ```
 
-Run scripts from the repository root. Each script also works when launched from
-`scripts/` because it changes back to the repository root internally.
+   For 650m / 830m, additional `EP_SIZE` (expert model parallel) and
+   `EXIT_DURATION_MIN` (wall-clock save+exit) env vars are available in the
+   script headers. Defaults: sequence length 1024, global batch size 512,
+   60k iters ≈ 30B tokens.
 
-UniPool shared-pool runs:
+   Dense and vanilla-MoE baselines under matched configs are also provided
+   as `scripts/train_llama_<size>_{dense,moe}.sh`. Outputs land in
+   `new_logs/<project_name>` (UniPool / MoE) and `logs/<project_name>`
+   (dense). Checkpoints are passed to both `--save` and `--load` so training
+   can resume from the same directory.
 
-```bash
-bash scripts/train_llama_182m_moe_UniPool.sh
-bash scripts/train_llama_469m_moe_UniPool.sh
-bash scripts/train_llama_650m_moe_UniPool.sh
-bash scripts/train_llama_830m_moe_UniPool.sh
-bash scripts/train_llama_978m_moe_UniPool.sh
-```
+## Acknowledgments
 
-Shared-pool script signature:
-
-```text
-bash scripts/train_llama_<size>_moe_UniPool.sh \
-  [gpus_per_node] [train_iters] [micro_batch_size] [num_experts] \
-  [norm_routing] [layer_aux_coeff] [pool_aux_coeff] [pool_size] \
-  [project_name] [save_interval] [save_retain_interval] [num_layers] [top_k]
-```
-
-For `650m` and `830m`, additional expert-parallel and wall-clock arguments are
-available in the script headers:
-
-- `EP_SIZE`: expert model parallel size.
-- `EXIT_DURATION_MIN`: save and exit after the time budget.
-
-Dense and vanilla MoE baselines are also included:
-
-```bash
-bash scripts/train_llama_182m_dense.sh
-bash scripts/train_llama_182m_moe.sh
-bash scripts/train_llama_469m_dense.sh
-bash scripts/train_llama_469m_moe.sh
-bash scripts/train_llama_650m_dense.sh
-bash scripts/train_llama_650m_moe.sh
-bash scripts/train_llama_830m_dense.sh
-bash scripts/train_llama_830m_moe.sh
-bash scripts/train_llama_978m_dense.sh
-bash scripts/train_llama_978m_moe.sh
-```
-
-By default, the scripts use sequence length 1024, global batch size 512, and
-`train_iters=60000`, corresponding to roughly 30B training tokens.
-
-Outputs are written to `new_logs/<project_name>` for MoE/UniPool runs and
-`logs/<project_name>` for the older dense baselines. Checkpoints are passed to
-both `--save` and `--load` so training can resume from the same directory.
-
-## Quick Checks
-
-These checks do not require the full GPU training stack:
-
-```bash
-python tests/test_unipool_release_checks.py
-find scripts -maxdepth 1 -name "*.sh" -exec bash -n {} \;
-PYTHONPYCACHEPREFIX=/tmp/unipool_pycache python -m py_compile \
-  megatron/core/transformer/moe/moe_layer.py \
-  megatron/core/transformer/moe/moe_utils.py \
-  megatron/core/transformer/moe/router.py \
-  megatron/core/transformer/transformer_block.py \
-  megatron/training/arguments.py \
-  megatron/training/checkpointing.py
-```
-
-Full pytest runs require the Megatron GPU dependency stack, including Triton
-and Transformer Engine. Note that `tests/unit_tests/` and
-`tests/functional_tests/` are inherited from the upstream Megatron-LM project;
-many of them reference NVIDIA-internal data paths (e.g. `/opt/data/...`,
-`/workspace/data/...`) and are not expected to pass on standard installations.
-Only `tests/test_unipool_release_checks.py` is part of the supported UniPool
-surface.
+UniPool builds on top of
+[NVIDIA Megatron-LM](https://github.com/NVIDIA/Megatron-LM) and adopts the
+experimental setup (data pipeline, LLaMA-architecture baselines, evaluation
+protocol) from [ReMoE](https://github.com/thu-ml/ReMoE) by Wang, Chen, and
+Zhu (arXiv:2412.14711). Upstream notices are retained in source files and
+summarized in [NOTICE](NOTICE).
 
 ## License
 
-UniPool modifications are released under the license terms in [LICENSE](LICENSE).
-This repository includes derivative work from Megatron-LM and other upstream
-projects; upstream notices are retained in source files and summarized in
-[NOTICE](NOTICE).
+UniPool modifications are released under the license terms in
+[LICENSE](LICENSE). This repository includes derivative work from
+Megatron-LM and other upstream projects.
