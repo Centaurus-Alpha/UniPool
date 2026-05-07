@@ -4,10 +4,8 @@
 Purpose
 -------
 Record per-layer ``tokens_per_expert`` on the validation set at the same cadence
-as ``args.eval_interval``, plus a minimal set of derived summary scalars, to
-decide whether per-layer expert preferences have differentiated enough to
-justify a Phase-B hard mask. See ``docs/UniPool_hbm_bottleneck.md`` for
-motivation.
+as ``args.eval_interval``, plus a minimal set of derived summary scalars for
+analyzing shared-pool expert utilization across layers.
 
 Design invariants
 -----------------
