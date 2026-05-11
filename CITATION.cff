@@ -1,8 +1,49 @@
 cff-version: 1.2.0
 title: UniPool
-message: "If you use UniPool, please cite the associated paper or this software release."
+message: "If you use UniPool, please cite the paper below or this software release."
 type: software
 repository-code: "https://github.com/UniPool/UniPool"
 license: BSD-3-Clause
 authors:
-  - name: "UniPool contributors"
+  - given-names: Minbin
+    family-names: Huang
+  - given-names: Han
+    family-names: Shi
+  - given-names: Chuanyang
+    family-names: Zheng
+  - given-names: Yimeng
+    family-names: Wu
+  - given-names: Guoxuan
+    family-names: Chen
+  - given-names: Xintong
+    family-names: Yu
+  - given-names: Yichun
+    family-names: Yin
+  - given-names: Hong
+    family-names: Cheng
+preferred-citation:
+  type: article
+  title: "UniPool: A Globally Shared Expert Pool for Mixture-of-Experts"
+  year: 2026
+  url: "https://arxiv.org/abs/2605.06665"
+  identifiers:
+    - type: other
+      value: "arXiv:2605.06665"
+      description: arXiv preprint
+  authors:
+    - given-names: Minbin
+      family-names: Huang
+    - given-names: Han
+      family-names: Shi
+    - given-names: Chuanyang
+      family-names: Zheng
+    - given-names: Yimeng
+      family-names: Wu
+    - given-names: Guoxuan
+      family-names: Chen
+    - given-names: Xintong
+      family-names: Yu
+    - given-names: Yichun
+      family-names: Yin
+    - given-names: Hong
+      family-names: Cheng

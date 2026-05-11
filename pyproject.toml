@@ -65,6 +65,7 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/UniPool/UniPool"
 Repository = "https://github.com/UniPool/UniPool"
+Paper = "https://arxiv.org/abs/2605.06665"
 Upstream = "https://github.com/NVIDIA/Megatron-LM"
 
 [project.optional-dependencies]

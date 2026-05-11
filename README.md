@@ -1,5 +1,8 @@
 # UniPool
 
+Codebase for the paper [*UniPool: A Globally Shared Expert Pool for
+Mixture-of-Experts*](https://arxiv.org/abs/2605.06665) (arXiv:2605.06665).
+
 ![UniPool overview](assets/overview.png)
 
 UniPool is a research code release for shared expert-pool Mixture-of-Experts
@@ -123,6 +126,20 @@ experimental setup (data pipeline, LLaMA-architecture baselines, evaluation
 protocol) from [ReMoE](https://github.com/thu-ml/ReMoE) by Wang, Chen, and
 Zhu (arXiv:2412.14711). Upstream notices are retained in source files and
 summarized in [NOTICE](NOTICE).
+
+## Citation
+
+If you use UniPool, please cite:
+
+```bibtex
+@article{huang2026unipool,
+  title={UniPool: A Globally Shared Expert Pool for Mixture-of-Experts},
+  author={Huang, Minbin and Shi, Han and Zheng, Chuanyang and Wu, Yimeng
+          and Chen, Guoxuan and Yu, Xintong and Yin, Yichun and Cheng, Hong},
+  journal={arXiv preprint arXiv:2605.06665},
+  year={2026}
+}
+```
 
 ## License
 
