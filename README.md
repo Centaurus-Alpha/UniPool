@@ -52,14 +52,20 @@ The paper studies two variants:
   is a quality reference and supports the reduced-pool (`M < E·L`) analysis.
 
 Test loss (lower is better) with matched expert-FFN budget and routed expert
-FLOPs. The first five columns use 8 experts per layer with top-1 routing.
-Training uses 30B Pile tokens up to 830M and 60B tokens at 1.5B.
+FLOPs. Training uses 30B Pile tokens up to 830M and 60B tokens at 1.5B.
+**Bold** marks the best loss in each column.
 
-|              | 182M   | 469M   | 650M   | 830M   | 1.5B   | 182M, 16E/top-2 | 182M, 32E/top-4 |
-|--------------|--------|--------|--------|--------|--------|-----------------|-----------------|
-| Vanilla MoE  | 1.9317 | 1.7982 | 1.7568 | 1.7309 | 1.6320 | 1.8589          | 1.7974          |
-| UniPool-lock | 1.9029 | 1.7615 | 1.7324 | 1.6944 | 1.6073 | 1.8291          | 1.7702          |
-| UniPool-full | 1.9029 | 1.7636 | 1.7260 | 1.6923 | –      | 1.8277          | 1.7672          |
+| Method | 182M | 469M | 650M | 830M | 1.5B | 16E/top‑2 | 32E/top‑4 |
+|:--|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| Vanilla MoE | 1.9317 | 1.7982 | 1.7568 | 1.7309 | 1.6320 | 1.8589 | 1.7974 |
+| UniPool‑lock | **1.9029** | **1.7615** | 1.7324 | 1.6944 | **1.6073** | 1.8291 | 1.7702 |
+| UniPool‑full | **1.9029** | 1.7636 | **1.7260** | **1.6923** | – | **1.8277** | **1.7672** |
+| *Δ lock − vanilla* | *−0.0288* | *−0.0367* | *−0.0244* | *−0.0365* | *−0.0247* | *−0.0298* | *−0.0272* |
+
+The five scale columns use 8 experts per layer with top-1 routing. The last
+two columns add full-width experts to the 12-layer 182M backbone, giving about
+268M (16E/top-2) and 438M (32E/top-4) active parameters. UniPool-full was not
+trained at 1.5B.
 
 The paper's controls locate the gain in the learned allocation:
 
