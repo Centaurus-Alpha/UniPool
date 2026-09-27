@@ -2,7 +2,7 @@
 
 import math
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
@@ -48,6 +48,18 @@ class Router(ABC, MegatronModule):
         self.moe_aux_loss_func = None
         self.layer_number = None
         self._pool_aux_loss_accumulator = None
+        # Runtime-only progressive curriculum controls (see moe/curriculum.py).
+        # The checkpoint owns the masks and the timeline; these fields are
+        # reconstructed before every training step and after a restore. Their
+        # defaults keep the curriculum-off path unchanged.
+        self._progressive_candidate_mask = None
+        self._progressive_hard_mask = None
+        self._progressive_anneal_alpha = 0.0
+        self._progressive_shadow_routing_map = None
+        self._progressive_entropy_support_mask = None
+        self._progressive_entropy_coeff = 0.0
+        self._progressive_entropy_target_log = None
+        self._progressive_compact_state = None
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
@@ -397,26 +409,57 @@ class TopKRouter(Router):
         return probs
 
     def _apply_pool_aux_loss(
-        self, probs: torch.Tensor, scores_for_aux_loss: torch.Tensor, routing_map: torch.Tensor
+        self,
+        probs: torch.Tensor,
+        scores_for_aux_loss: torch.Tensor,
+        routing_map: torch.Tensor,
+        *,
+        visible_index: Optional[torch.Tensor] = None,
     ):
         """Apply pool-level auxiliary loss using one-step-behind global token distribution.
 
         Each layer computes its per-layer contribution to the pool loss using
         global_tokens_per_expert from the previous micro-batch. The sum over all layers
         equals coeff * E * dot(global_f, global_P).
+
+        Args:
+            visible_index: progressive compact router tail only. When given,
+                ``scores_for_aux_loss`` and ``routing_map`` are the compact
+                ``[num_tokens, K]`` tail outputs and this is the ``[K]``
+                ascending pool id of each visible column. Both per-expert
+                reductions are scattered back to pool space (out-of-place
+                ``index_add`` on zeros, so the aggregated probs stay
+                differentiable) before the accumulator sees them: its history
+                is global state shared by every layer. The dropped columns
+                contribute exactly zero on the full-width path, so the pool
+                vectors are identical up to floating-point reduction order.
         """
         pool_acc = self._pool_aux_loss_accumulator
         if pool_acc is None:
             return probs
 
         tokens_per_expert = routing_map.sum(dim=0)
+        aggregated_probs = None
+        if visible_index is not None:
+            num_experts = self.config.num_moe_experts
+            tokens_per_expert = torch.zeros(
+                num_experts, dtype=tokens_per_expert.dtype, device=tokens_per_expert.device
+            ).index_add(0, visible_index, tokens_per_expert)
+            visible_probs = scores_for_aux_loss.sum(dim=0)
+            aggregated_probs = torch.zeros(
+                num_experts, dtype=visible_probs.dtype, device=visible_probs.device
+            ).index_add(0, visible_index, visible_probs)
+            scores_for_aux_loss = None
         tokens_per_expert = reduce_from_tensor_model_parallel_region(
             tokens_per_expert, self.tp_cp_group
         )
         total_num_tokens = routing_map.shape[0] * self.tp_cp_group.size()
 
         pool_loss = pool_acc.accumulate_and_compute_loss(
-            scores_for_aux_loss, tokens_per_expert, total_num_tokens
+            scores_for_aux_loss,
+            tokens_per_expert,
+            total_num_tokens,
+            aggregated_probs=aggregated_probs,
         )
 
         if pool_loss is not None:
@@ -804,6 +847,98 @@ class ReLURouter(Router):
         return scores, routing_map
 
 
+def apply_progressive_score_annealing(
+    scores: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    alpha: float,
+    *,
+    active_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Scale the scores of experts outside ``candidate_mask`` by ``1 - alpha``.
+
+    The progressive curriculum ramps ``alpha`` from 0 to 1 with a cosine over
+    the anneal window, so the forward changes continuously from the full pool
+    to the candidate partition. ``alpha == 0`` returns ``scores`` unchanged.
+    """
+
+    if not torch.is_floating_point(scores):
+        raise TypeError("progressive scores must use a floating dtype")
+    if candidate_mask.dtype != torch.bool:
+        raise TypeError("candidate mask must use bool dtype")
+    if scores.dim() < 1 or candidate_mask.dim() not in (1, scores.dim()):
+        raise ValueError("candidate mask shape is not broadcastable to scores")
+    if candidate_mask.shape[-1] != scores.shape[-1]:
+        raise ValueError("candidate mask shape must match the expert dimension")
+    try:
+        candidate = candidate_mask.to(device=scores.device).expand_as(scores)
+    except RuntimeError as exc:
+        raise ValueError("candidate mask shape is not broadcastable to scores") from exc
+    progress = float(alpha)
+    if not math.isfinite(progress) or not 0.0 <= progress <= 1.0:
+        raise ValueError("anneal alpha must be finite and in [0, 1]")
+    if active_mask is not None:
+        if active_mask.dtype != torch.bool:
+            raise TypeError("active mask must use bool dtype")
+        if active_mask.shape[-1] != scores.shape[-1]:
+            raise ValueError("active mask shape must match the expert dimension")
+        try:
+            active = active_mask.to(device=scores.device).expand_as(scores)
+        except RuntimeError as exc:
+            raise ValueError("active mask shape is not broadcastable to scores") from exc
+        if not bool(torch.all(candidate <= active).item()):
+            raise ValueError("candidate mask must be nested in the active hard mask")
+    if progress == 0.0:
+        return scores
+    multiplier = candidate.to(dtype=scores.dtype) + (~candidate).to(dtype=scores.dtype) * (
+        1.0 - progress
+    )
+    return scores * multiplier
+
+
+def compute_layer_entropy_target_cardinality_terms(
+    scores: torch.Tensor,
+    target_log_cardinality: float,
+    *,
+    support_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Entropy ``H`` of the population routing distribution and ``H - log(M)``.
+
+    Args:
+        scores: ``[num_tokens, num_experts]`` non-negative routing scores.
+        target_log_cardinality: ``log(M)`` for the target effective number of
+            experts ``M >= 1``.
+        support_mask: optional bool ``[..., num_experts]`` mask; scores outside
+            it are zeroed before averaging.
+
+    Returns:
+        ``(entropy, deviation)``, both 0-dim tensors.
+    """
+    target_H = float(target_log_cardinality)
+    if not math.isfinite(target_H) or target_H < 0.0:
+        raise ValueError("target_log_cardinality must be finite and non-negative")
+    if not torch.is_floating_point(scores):
+        raise TypeError("entropy scores must use a floating dtype")
+    work_scores = scores.float() if scores.dtype in (torch.float16, torch.bfloat16) else scores
+    if support_mask is not None:
+        if support_mask.dtype != torch.bool:
+            raise TypeError("entropy support_mask must use bool dtype")
+        if support_mask.shape[-1] != scores.shape[-1]:
+            raise ValueError("entropy support_mask shape must match the expert dimension")
+        try:
+            support = support_mask.to(device=scores.device).expand_as(scores)
+        except RuntimeError as exc:
+            raise ValueError("entropy support_mask shape is not broadcastable") from exc
+        if not bool(torch.any(support).item()):
+            raise ValueError("entropy support_mask cannot be empty")
+        work_scores = work_scores * support.to(dtype=work_scores.dtype)
+    eps = 1e-8
+    avg_probs = work_scores.mean(dim=0)
+    avg_probs = avg_probs / (avg_probs.sum() + eps)
+    log_probs = torch.log(avg_probs + eps)
+    entropy = -(avg_probs * log_probs).sum()
+    return entropy, entropy - target_H
+
+
 class NormRouter(TopKRouter):
     """Route each token to top-k experts using L2-normalized ReLU routing.
 
@@ -886,6 +1021,88 @@ class NormRouter(TopKRouter):
             samples.append(1.0 / (y_k ** 2).sum() ** 0.5)
         return float(np.mean(samples))
 
+    def _progressive_compact_routing(
+        self, logits: torch.Tensor, state: Dict[str, Any]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Progressive compact router tail: everything after the L2 norm on ``[T, K]``.
+
+        Runs instead of the full-width tail of :meth:`routing` once the
+        progressive partition is locked (training only). The returned
+        ``probs`` / ``routing_map`` are ``[num_tokens, K]`` in the layer's
+        compact column order; ``MoELayer._progressive_compact_apply``
+        recognises that width and hands them straight to the compact dispatcher.
+
+        Value identity with the full-width masked path:
+
+        * The **L2 norm stays over all E logits.** Under the hard mask the full
+          path deliberately keeps invisible logits inside the norm, so every
+          router row keeps receiving gradient through it. The gate GEMM, the
+          norm and its backward stay E-wide.
+        * The division, ReLU and the two scale multiplies are elementwise and
+          run in the same order as the full path, so every visible column is
+          bitwise equal to its full-width counterpart.
+        * Every column here is visible, so both ``masked_fill`` calls of the
+          full path are no-ops and disappear.
+        * The pool aux loss is scattered back to pool space (see
+          ``_apply_pool_aux_loss``); the entropy term needs no support mask,
+          because every invisible column contributes ``0 * log(0 + eps) == 0``
+          on the full path.
+
+        The expert mask is never read on the device here: the compact state's
+        ``visible_index_device`` is the source of truth, which removes the
+        blocking host syncs the full path pays per layer-forward.
+        """
+        if self.expert_bias is not None:
+            raise RuntimeError(
+                "progressive compact router tail does not support router expert bias"
+            )
+        if self.config.moe_expert_capacity_factor is not None:
+            raise RuntimeError("progressive compact router tail requires dropless routing")
+        if self.is_aux_loss_enabled():
+            raise RuntimeError(
+                "progressive compact router tail does not support per-layer aux losses"
+            )
+        num_visible = int(state["num_visible"])
+        if self.topk > num_visible:
+            raise RuntimeError(
+                f"progressive compact router tail requires topk <= K "
+                f"(topk={self.topk}, K={num_visible})"
+            )
+        visible = state["visible_index_device"]
+        if visible.device != logits.device:
+            # Value-idempotent relocation into the SHARED state dict (the same
+            # write ``_progressive_compact_apply`` performs), so both
+            # microbatches and the recompute forward replay identically.
+            visible = state["visible_index"].to(device=logits.device)
+            state["visible_index_device"] = visible
+
+        # FULL-width L2 norm; do not "optimise" this to the visible columns.
+        norm = logits.norm(2, dim=-1, keepdim=True)
+        logits_v = logits.index_select(1, visible)
+        logits_normed_v = logits_v / (norm + self.norm_eps)
+        scores_v = torch.relu(logits_normed_v) * self.norm_scale * self.scale_initial
+        # No candidate mask exists after the lock, so there is no shadow route.
+        self._progressive_shadow_routing_map = None
+
+        _, indices = torch.topk(scores_v, k=self.topk, dim=1)
+        routing_map_v = torch.zeros_like(scores_v, dtype=torch.bool).scatter_(1, indices, True)
+        probs_v = scores_v * routing_map_v
+
+        if self.training and torch.is_grad_enabled() and self._pool_aux_loss_accumulator is not None:
+            probs_v = self._apply_pool_aux_loss(
+                probs_v, scores_v, routing_map_v, visible_index=visible
+            )
+        target_log = self._progressive_entropy_target_log
+        entropy_coeff = float(self._progressive_entropy_coeff)
+        if target_log is not None and entropy_coeff > 0 and torch.is_grad_enabled():
+            probs_v = self._apply_layer_entropy_loss(
+                probs_v, scores_v, entropy_coeff, float(target_log), support_mask=None
+            )
+        # The full path ends with ``_apply_expert_bias``; it is a guaranteed
+        # no-op here (expert bias is rejected above) and is skipped to avoid a
+        # jit re-trace on the new [T, K] shape.
+        return probs_v, routing_map_v
+
     def routing(self, logits: torch.Tensor, expert_mask: Optional[torch.Tensor] = None):
         """Norm-based routing function.
 
@@ -909,6 +1126,12 @@ class NormRouter(TopKRouter):
                 (2) masked entries receive ``finfo.min`` scores **only for
                 the top-k argmax**, so ``torch.topk`` never selects them.
 
+                The progressive curriculum's hard mask (the mask object the
+                curriculum also installed as ``_progressive_hard_mask``) skips
+                step (1): locked-out logits stay inside the L2 norm, so the
+                forward at the end of the score anneal and the hard-locked
+                forward share one score surface.
+
         Returns:
             probs (torch.Tensor): Token-to-expert assignment probabilities.
             routing_map (torch.Tensor): Token-to-expert assignment mapping.
@@ -919,9 +1142,23 @@ class NormRouter(TopKRouter):
         # Apply Z-Loss (optional, for logit stability)
         logits = self.apply_z_loss(logits)
 
+        # Progressive curriculum: once the partition is locked, run the whole
+        # post-norm tail on the layer's K visible columns (training only; eval
+        # keeps the full-width path so routing diagnostics stay in pool space).
+        if self.training:
+            compact_state = getattr(self, "_progressive_compact_state", None)
+            if (
+                compact_state is not None
+                and expert_mask is not None
+                and getattr(self, "_progressive_hard_mask", None) is expert_mask
+                and getattr(self, "_progressive_candidate_mask", None) is None
+            ):
+                return self._progressive_compact_routing(logits, compact_state)
+
         # Broadcast the mask to 2D ``[num_tokens, num_experts]`` once; reused at
         # the pre-norm zero-fill and post-ReLU top-k exclusion sites below.
         mask_2d: Optional[torch.Tensor] = None
+        progressive_hard_2d: Optional[torch.Tensor] = None
         if expert_mask is not None:
             mask_2d = expert_mask.to(device=logits.device, dtype=torch.bool)
             while mask_2d.dim() > 2:
@@ -930,9 +1167,48 @@ class NormRouter(TopKRouter):
                 mask_2d = mask_2d.unsqueeze(0).expand_as(logits)
             elif mask_2d.shape != logits.shape:
                 mask_2d = mask_2d.expand_as(logits)
+            progressive_hard = getattr(self, "_progressive_hard_mask", None)
+            if progressive_hard is not None:
+                # The curriculum installs _progressive_hard_mask and the MoE
+                # layer's _pool_slot_mask as the SAME tensor object, so identity
+                # implies equality; otherwise the (objects, versions) cache pins
+                # a pair that was already verified equal. Either way the
+                # per-microbatch comparison and its host sync are skipped, while
+                # any in-place mutation or replacement is re-verified.
+                verified = progressive_hard is expert_mask
+                if not verified:
+                    check_cache = getattr(self, "_progressive_hard_check_cache", None)
+                    verified = (
+                        check_cache is not None
+                        and check_cache[0] is progressive_hard
+                        and check_cache[1] is expert_mask
+                        and check_cache[2] == progressive_hard._version
+                        and check_cache[3] == expert_mask._version
+                    )
+                if verified:
+                    progressive_hard_2d = mask_2d
+                else:
+                    progressive_hard_2d = progressive_hard.to(
+                        device=logits.device, dtype=torch.bool
+                    )
+                    if progressive_hard_2d.dim() == 1:
+                        progressive_hard_2d = progressive_hard_2d.unsqueeze(0).expand_as(logits)
+                    elif progressive_hard_2d.shape != logits.shape:
+                        progressive_hard_2d = progressive_hard_2d.expand_as(logits)
+                    if not torch.equal(progressive_hard_2d, mask_2d):
+                        raise ValueError(
+                            "progressive hard mask must equal the MoE layer expert mask"
+                        )
+                    self._progressive_hard_check_cache = (
+                        progressive_hard,
+                        expert_mask,
+                        progressive_hard._version,
+                        expert_mask._version,
+                    )
             # Zero masked logits so they contribute nothing to the L2 norm
             # (and subsequently nothing to any score below).
-            logits = logits.masked_fill(~mask_2d, 0.0)
+            if progressive_hard_2d is None:
+                logits = logits.masked_fill(~mask_2d, 0.0)
 
         # L2 normalize across expert dimension
         norm = logits.norm(2, dim=-1, keepdim=True)
@@ -940,6 +1216,33 @@ class NormRouter(TopKRouter):
 
         # ReLU + scale
         scores = torch.relu(logits_normed) * self.norm_scale * self.scale_initial
+
+        # Progressive anneal window: record the unattenuated ("shadow") route for
+        # the curriculum's natural-preference diagnostics, then fade the scores
+        # of experts outside the candidate partition with the cosine alpha.
+        candidate_mask = getattr(self, "_progressive_candidate_mask", None)
+        anneal_alpha = float(getattr(self, "_progressive_anneal_alpha", 0.0))
+        self._progressive_shadow_routing_map = None
+        if candidate_mask is not None:
+            candidate_2d = candidate_mask.to(device=scores.device, dtype=torch.bool)
+            if candidate_2d.dim() == 1:
+                candidate_2d = candidate_2d.unsqueeze(0).expand_as(scores)
+            elif candidate_2d.shape != scores.shape:
+                candidate_2d = candidate_2d.expand_as(scores)
+            shadow_scores = scores
+            if self.expert_bias is not None:
+                shadow_scores = shadow_scores + self.expert_bias
+            if mask_2d is not None:
+                shadow_scores = shadow_scores.masked_fill(
+                    ~mask_2d, torch.finfo(shadow_scores.dtype).min
+                )
+            _, shadow_indices = torch.topk(shadow_scores, k=self.topk, dim=1)
+            self._progressive_shadow_routing_map = torch.zeros_like(
+                scores, dtype=torch.bool
+            ).scatter(1, shadow_indices, True)
+            scores = apply_progressive_score_annealing(
+                scores, candidate_2d, anneal_alpha, active_mask=mask_2d
+            )
 
         # Top-k selection (add expert bias for selection if enabled)
         if self.expert_bias is not None:
@@ -954,6 +1257,10 @@ class NormRouter(TopKRouter):
         if mask_2d is not None:
             scores_for_topk = scores_for_topk.masked_fill(
                 ~mask_2d, torch.finfo(scores_for_topk.dtype).min
+            )
+        if candidate_mask is not None and anneal_alpha >= 1.0:
+            scores_for_topk = scores_for_topk.masked_fill(
+                ~candidate_2d, torch.finfo(scores_for_topk.dtype).min
             )
 
         _, indices = torch.topk(scores_for_topk, k=self.topk, dim=1)
@@ -973,6 +1280,11 @@ class NormRouter(TopKRouter):
 
         # Apply auxiliary losses
         scores_for_aux_loss = scores
+        if progressive_hard_2d is not None:
+            # The hard mask keeps locked-out logits inside the L2 norm (above),
+            # but the auxiliary losses must assign no soft mass or gradient to
+            # experts the router can never select.
+            scores_for_aux_loss = scores_for_aux_loss.masked_fill(~mask_2d, 0.0)
         routing_map_for_aux_loss = routing_map
 
         if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
@@ -990,11 +1302,59 @@ class NormRouter(TopKRouter):
                 probs, scores_for_aux_loss, routing_map_for_aux_loss
             )
 
+        # Progressive target-cardinality entropy loss,
+        # coeff * (H - log(M))^2 / num_layers, pulling each layer's population
+        # routing entropy toward log(M).
+        target_log = getattr(self, "_progressive_entropy_target_log", None)
+        entropy_coeff = float(getattr(self, "_progressive_entropy_coeff", 0.0))
+        if (
+            target_log is not None
+            and entropy_coeff > 0
+            and self.training
+            and torch.is_grad_enabled()
+        ):
+            probs = self._apply_layer_entropy_loss(
+                probs,
+                scores_for_aux_loss,
+                entropy_coeff,
+                float(target_log),
+                support_mask=getattr(self, "_progressive_entropy_support_mask", None),
+            )
+
         # Update expert bias tracker
         self._apply_expert_bias(routing_map)
 
         return probs, routing_map
 
+    def _apply_layer_entropy_loss(
+        self,
+        probs: torch.Tensor,
+        scores: torch.Tensor,
+        coeff: float,
+        target_log_cardinality: float,
+        *,
+        support_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Attach ``coeff * (H - log M)^2 / num_layers`` to ``probs`` via autograd.
+
+        ``H`` is the entropy of the layer's population-level routing
+        distribution; raw ``H`` and the deviation are logged to the aux-loss
+        tracker.
+        """
+        entropy, deviation = compute_layer_entropy_target_cardinality_terms(
+            scores, target_log_cardinality, support_mask=support_mask
+        )
+        num_layers = self.config.num_layers
+        if self.config.mtp_num_layers is not None:
+            num_layers += self.config.mtp_num_layers
+        entropy_loss = coeff * deviation.pow(2) / num_layers
+        save_to_aux_losses_tracker("layer_entropy", entropy, self.layer_number, num_layers)
+        save_to_aux_losses_tracker("layer_entropy_dev", deviation, self.layer_number, num_layers)
+        if self.calculate_per_token_loss:
+            probs = MoEAuxLossAutoScaler.apply(probs, entropy_loss * probs.shape[0])
+        else:
+            probs = MoEAuxLossAutoScaler.apply(probs, entropy_loss)
+        return probs
 
 class HashRouter(MegatronModule):
     """Parameter-free hash router that assigns tokens to experts deterministically.

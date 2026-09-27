@@ -1,48 +1,74 @@
 # UniPool
 
-Codebase for the paper [*UniPool: A Globally Shared Expert Pool for
-Mixture-of-Experts*](https://arxiv.org/abs/2605.06665) (arXiv:2605.06665).
+Codebase for the paper [*UniPool: Learning Expert-to-Layer Ownership from
+Brief Global Access*](https://arxiv.org/abs/2605.06665) (arXiv:2605.06665).
 
 ![UniPool overview](assets/overview.png)
 
-UniPool is a research code release for shared expert-pool Mixture-of-Experts
-(MoE) training on top of Megatron-LM/Megatron Core. It adds a mode where MoE
-layers keep separate routers while sharing a global or grouped expert pool.
+Most Mixture-of-Experts (MoE) transformers assign each expert to one layer
+before training starts, while the experts are still interchangeable. UniPool
+instead *learns* the expert-to-layer allocation. During a short full-pool
+phase, every layer routes over one globally shared expert pool. UniPool then
+gives each expert to exactly one layer, locks this disjoint allocation, and
+trains the rest of the run as a layer-private MoE.
 
-This repository is a derivative of NVIDIA Megatron-LM. The training and
-evaluation setup (Pile preprocessing, LLaMA-architecture baselines at the
-182M–978M scale) follows the protocol used by
-[ReMoE](https://github.com/thu-ml/ReMoE), reusing its data pipeline so
-results are directly comparable. The original upstream Megatron README is
-preserved as [README_MEGATRON.md](README_MEGATRON.md).
+This repository is a research fork of NVIDIA Megatron-LM / Megatron Core. The
+training and evaluation setup (Pile preprocessing, LLaMA-architecture
+backbones) follows the protocol of [ReMoE](https://github.com/thu-ml/ReMoE)
+and reuses its data pipeline, so results are directly comparable. The original
+upstream Megatron README is preserved as [README_MEGATRON.md](README_MEGATRON.md).
 
 ## What is UniPool?
 
-UniPool ("Unified Expert Pool") is a Mixture-of-Experts architecture that
-replaces the standard per-layer expert ownership with a single **globally
-shared expert pool**. In a vanilla MoE transformer, each of the L layers
-maintains its own private set of E expert FFNs, hard-coding a linear
-relationship between depth and total expert parameters. UniPool removes this
-constraint: all L layers route into one shared pool of M experts, while each
-layer keeps its own independent router. Any expert can be selected by any
-depth, so capacity is reused across layers instead of duplicated.
+A vanilla MoE layer `l` owns a private bank of `E` experts. UniPool replaces
+the `L` private banks with one pool of `M` experts and keeps a separate router
+per layer. Layer `l` selects its top-k experts among the experts it can see.
 
-Two components make shared-pool training stable:
+Two components make shared-pool training work:
 
-- **Pool-level auxiliary loss.** Load balancing is computed by aggregating
-  token-to-expert assignments over the *whole pool* rather than per layer.
-  This prevents globally dead experts without forcing every layer to use
-  every expert, which would destroy layer-specific specialization.
-- **NormRouter.** An L2-normalize → ReLU gating function with a learnable
-  scale, used in place of softmax. It keeps routing scores sparse and
-  scale-stable when many per-layer routers compete over the same large pool.
+- **Pool-level auxiliary loss.** This loss balances *aggregate* usage across
+  all layers instead of within each layer. An expert that one layer ignores
+  can serve another, so layers keep distinct preferences and no expert dies
+  globally.
+- **NormRouter.** Router logits go through L2 normalization, then ReLU, then a
+  learnable scale. Scores do not depend on each layer's logit norm, so layers
+  compete for the pool on a common scale.
 
-Across five LLaMA-architecture active-parameter scales (182M / 469M / 650M /
-830M / 978M) trained on 30B tokens of the Pile, UniPool improves validation
-loss over matched vanilla MoE by up to 0.0386, and reduced-pool variants
-using only 41.6%–66.7% of the vanilla expert-parameter budget match or
-outperform layer-wise MoE — pool size becomes an explicit, sublinear
-depth-scaling knob.
+The paper studies two variants:
+
+- **UniPool-lock (main method).**
+  - **Full-pool phase (first 2K steps).** Every layer can use every expert.
+    A target-cardinality entropy loss concentrates each layer on about `E`
+    experts, while the pool loss keeps different layers on different experts.
+  - **Assign.** At step 1K, a small assignment problem gives every expert
+    exactly one owner layer from validation routing statistics.
+  - **Anneal.** Off-allocation scores are faded out with a cosine ramp over
+    steps 1K–2K.
+  - **Lock.** The allocation is locked at step 2K.
+  - **After the lock**, each layer routes over its own `E` experts only.
+    Expert parameters and routed FLOPs match vanilla MoE, and compact
+    dispatch keeps the step time within −0.7% to +2.8% of vanilla MoE.
+- **UniPool-full.** Every layer keeps full-pool access for the whole run. It
+  is a quality reference and supports the reduced-pool (`M < E·L`) analysis.
+
+Test loss (lower is better) with matched expert-FFN budget and routed expert
+FLOPs. The first five columns use 8 experts per layer with top-1 routing.
+Training uses 30B Pile tokens up to 830M and 60B tokens at 1.5B.
+
+|              | 182M   | 469M   | 650M   | 830M   | 1.5B   | 182M, 16E/top-2 | 182M, 32E/top-4 |
+|--------------|--------|--------|--------|--------|--------|-----------------|-----------------|
+| Vanilla MoE  | 1.9317 | 1.7982 | 1.7568 | 1.7309 | 1.6320 | 1.8589          | 1.7974          |
+| UniPool-lock | 1.9029 | 1.7615 | 1.7324 | 1.6944 | 1.6073 | 1.8291          | 1.7702          |
+| UniPool-full | 1.9029 | 1.7636 | 1.7260 | 1.6923 | –      | 1.8277          | 1.7672          |
+
+The paper's controls locate the gain in the learned allocation:
+
+- A random disjoint allocation fixed at initialization, trained with the same
+  router and losses, only matches vanilla MoE.
+- Locking the allocation learned in the full-pool phase recovers nearly all
+  of the persistent full-pool gain.
+- UniPool-full also beats vanilla MoE with only 66.7% (182M) to 50% (469M,
+  650M) of its expert parameters.
 
 ## Installation
 
@@ -55,6 +81,7 @@ From the repository root:
 
 ```bash
 pip install --no-build-isolation -e ".[mlm,dev]"
+pip install "scipy>=1.9"   # allocation solver used by UniPool-lock
 ```
 
 The distribution package name is `unipool-megatron`. The Python import path
@@ -62,8 +89,8 @@ remains `megatron` because this is a Megatron fork.
 
 ## Usage
 
-The UniPool routing/expert-pool surface is enabled with these flags (see
-`scripts/train_llama_*_moe_UniPool.sh` for full configurations):
+The shared-pool surface is enabled with these flags (see
+`scripts/train_llama_*_moe_UniPool.sh` for full UniPool-full configurations):
 
 - `--moe-expert-pool-mode hyper` — each MoE layer gets its own router while
   sharing a global or grouped expert pool.
@@ -74,8 +101,99 @@ The UniPool routing/expert-pool surface is enabled with these flags (see
   layers that share a pool.
 - `--moe-norm-routing` — NormRouter (default in UniPool scripts).
 
+UniPool-lock adds `--moe-progressive-curriculum` on top of a global pool; see
+the next section.
+
 Core implementation lives in `megatron/core/transformer/moe/{moe_layer,
 moe_utils,router}.py` and `megatron/training/{arguments,checkpointing}.py`.
+
+## UniPool-lock: Ownership Learning and Lock
+
+UniPool-lock trains a global pool of `M = K * L` experts and then hands every
+layer its own `K` experts (`K = E`, the vanilla per-layer count). The
+per-layer expert sets are chosen from where the routers actually send tokens
+during the full-pool phase.
+
+The run has three phases. The boundaries are fractions of `--train-iters`;
+the iterations below are for the default 60k-iteration recipe.
+
+1. **Full-pool phase (iterations 0–1000).** The run is plain UniPool.
+   - A target-cardinality entropy loss is added:
+     `coeff * (H_l - log K_tar)^2 / L`, with `K_tar = K = 8` and `coeff = 5e-3`.
+   - `H_l` is the entropy of layer `l`'s population-level routing distribution.
+   - The coefficient warms up linearly over the first 1000 iterations.
+2. **Candidate freeze (validation at 1000).**
+   - Routing counts are EMA-smoothed over the last validations.
+   - An exact MILP partitions the pool: every layer gets exactly
+     `K = num_experts / num_layers` experts, and every expert gets exactly one
+     owner.
+   - The MILP targets 95% routed-token coverage per layer. When that is
+     infeasible, it locks the best-coverage partition and logs the per-layer
+     deficits.
+3. **Anneal and lock (iterations 1000–2000).**
+   - Router scores of experts outside each layer's partition are faded out
+     with a cosine ramp.
+   - At iteration 2000 the partition is installed as a hard mask for the rest
+     of training.
+   - Locked-out logits stay inside NormRouter's L2 norm, so the end of the ramp
+     and the locked forward compute the same scores.
+
+Throughout the run, a fail-stop halts training if the validation loss exceeds
+the value measured at the candidate freeze by more than 0.05 on two
+consecutive validations.
+
+```bash
+bash scripts/train_llama_182m_moe_UniPool_curriculum.sh   # 12 layers, 96 experts, K = 8
+bash scripts/train_llama_469m_moe_UniPool_curriculum.sh   # 24 layers, 192 experts, K = 8
+#   [gpus_per_node] [train_iters] [micro_batch_size] [project_name]
+#   env: SEED, POOL_AUX, SAVE_INTERVAL, SAVE_RETAIN_INTERVAL, EVAL_INTERVAL, EVAL_ITERS
+```
+
+Flags:
+
+- `--moe-progressive-curriculum` enables UniPool-lock.
+  - It requires `--moe-expert-pool-mode hyper` with one global pool and
+    `--moe-norm-routing`.
+  - It requires `--moe-pool-aux-loss-coeff > 0` and `--moe-aux-loss-coeff 0`.
+  - It requires `num_experts` to be a multiple of `num_layers`, and
+    PP = EP = 1.
+- `--moe-progressive-{lock,anneal,entropy-warmup}-fraction` set the schedule.
+  `--eval-interval` must divide both the freeze and the lock iteration.
+- `--moe-progressive-entropy-{coeff,target}` set the entropy loss.
+- `--moe-progressive-final-coverage-threshold` sets the MILP coverage target.
+- `--moe-progressive-max-val-loss-excess` and
+  `--moe-progressive-loss-excess-consecutive` set the fail-stop.
+- `--moe-progressive-ema-{lookback,alpha}` set the routing-count smoothing.
+- Three runtime paths make the post-lock step as cheap as the equivalent
+  vanilla layer without changing numerics. The launchers enable all three.
+  - `--moe-progressive-compact-dispatch` runs dispatch and grouped GEMM over
+    the `K` visible experts. It requires the TE grouped-GEMM alltoall path with
+    TP = 1.
+  - `--moe-progressive-compact-router` runs the NormRouter tail after the L2
+    norm on the `K` visible columns.
+  - `--moe-progressive-overlap-grad-reduce` makes `--overlap-grad-reduce` safe
+    by declaring the per-step gradient-hook firing count of every pool expert
+    at each mask install.
+
+The partition solver needs SciPy ≥ 1.9, which is checked at launch.
+
+The curriculum state is embedded in every checkpoint. It holds the partition,
+the anneal window and the smoothed routing history. Resuming restores it
+exactly. Resuming past iteration 0 from a checkpoint without that state is
+refused.
+
+The following curriculum metrics are logged at every validation under
+`curriculum/progressive/*`:
+
+- per-layer K and routed-token coverage;
+- natural and effective candidate coverage;
+- routes outside the hard mask, which must be 0 after the lock;
+- effective routed cardinality.
+
+The implementation lives in
+`megatron/core/transformer/moe/{progressive_curriculum,curriculum}.py`. CPU
+tests are in `tests/unit_tests/transformer/moe/test_progressive_curriculum.py`
+(run with `pytest --noconftest`).
 
 ## Reproducing the Results
 
@@ -94,8 +212,12 @@ moe_utils,router}.py` and `megatron/training/{arguments,checkpointing}.py`.
 2. **Training.** UniPool shared-pool runs:
 
    ```bash
+   # UniPool-full (persistent full-pool access)
    bash scripts/train_llama_<size>_moe_UniPool.sh
    #   size in {182m, 469m, 650m, 830m, 978m}
+   # UniPool-lock (ownership learning + lock; see the section above)
+   bash scripts/train_llama_<size>_moe_UniPool_curriculum.sh
+   #   size in {182m, 469m}
    ```
 
    Full script signature:
@@ -133,9 +255,9 @@ If you use UniPool, please cite:
 
 ```bibtex
 @article{huang2026unipool,
-  title={UniPool: A Globally Shared Expert Pool for Mixture-of-Experts},
+  title={UniPool: Learning Expert-to-Layer Ownership from Brief Global Access},
   author={Huang, Minbin and Shi, Han and Zheng, Chuanyang and Wu, Yimeng
-          and Chen, Guoxuan and Yu, Xintong and Yin, Yichun and Cheng, Hong},
+          and Chen, Guoxuan and Yu, Xingtong and Yin, Yichun and Cheng, Hong},
   journal={arXiv preprint arXiv:2605.06665},
   year={2026}
 }

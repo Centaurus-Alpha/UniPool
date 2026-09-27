@@ -56,6 +56,10 @@ _registered_router_ids: set[int] = set()
 _router_slots: List[Tuple[int, "Router"]] = []  # (layer_number, router)
 _hook_handles: List[Any] = []
 _accumulator: Dict[int, torch.Tensor] = {}  # layer_number -> LongTensor[num_experts]
+# Unattenuated ("shadow") routing counts. They equal ``_accumulator`` except
+# inside the progressive curriculum's anneal window, where the router also
+# records the route it would have taken without the score attenuation.
+_shadow_accumulator: Dict[int, torch.Tensor] = {}
 _active: bool = False
 
 # K values for the cross-layer top-K union summaries. Kept in sync with the
@@ -151,6 +155,22 @@ def _make_hook(layer_number: int):
             _accumulator[layer_number] = acc
         acc.add_(counts)
 
+        shadow_map = getattr(module, "_progressive_shadow_routing_map", None)
+        if shadow_map is None:
+            shadow_map = routing_map
+        if not torch.is_tensor(shadow_map) or shadow_map.dtype != torch.bool:
+            return
+        shadow_counts = shadow_map.to(torch.int64).sum(dim=0)
+        shadow_acc = _shadow_accumulator.get(layer_number)
+        if (
+            shadow_acc is None
+            or shadow_acc.shape != shadow_counts.shape
+            or shadow_acc.device != shadow_counts.device
+        ):
+            shadow_acc = torch.zeros_like(shadow_counts)
+            _shadow_accumulator[layer_number] = shadow_acc
+        shadow_acc.add_(shadow_counts)
+
     return _hook
 
 
@@ -187,19 +207,23 @@ def start_recording() -> None:
     _active = True
     for k in list(_accumulator.keys()):
         _accumulator[k].zero_()
+    for k in list(_shadow_accumulator.keys()):
+        _shadow_accumulator[k].zero_()
 
 
-def _assemble_matrix() -> Optional[torch.Tensor]:
+def _assemble_accumulator_matrix(
+    accumulator: Dict[int, torch.Tensor]
+) -> Optional[torch.Tensor]:
     """Stack per-layer accumulators into ``[num_layers, num_experts]`` int64.
 
     Returns None if nothing was recorded (e.g., pipeline-parallel ranks that
     don't own any decoder layers in this stage, or if register() found no
     routers).
     """
-    if not _accumulator:
+    if not accumulator:
         return None
-    layer_numbers = sorted(_accumulator.keys())
-    tensors = [_accumulator[l] for l in layer_numbers]
+    layer_numbers = sorted(accumulator.keys())
+    tensors = [accumulator[l] for l in layer_numbers]
     # All rows must have identical num_experts — in this fork they always do
     # (one pool size per model). If they differ (future shapes-per-layer
     # scenario), fall back to per-layer save by zero-padding to max.
@@ -215,6 +239,10 @@ def _assemble_matrix() -> Optional[torch.Tensor]:
                 padded.append(buf)
         tensors = padded
     return torch.stack(tensors, dim=0).contiguous()  # [L, E]
+
+
+def _assemble_matrix() -> Optional[torch.Tensor]:
+    return _assemble_accumulator_matrix(_accumulator)
 
 
 def _compute_summaries(matrix_cpu: torch.Tensor, topk: int = 16) -> Dict[str, float]:
@@ -346,8 +374,9 @@ def finalize_and_log(
     Fail-safe: any exception is caught and logged; eval is never affected.
     Must be called on all ranks (participates in a collective all-reduce).
 
-    Returns a dict ``{"matrix_cpu", "layer_numbers", "summaries"}`` on success,
-    or ``None`` if nothing was recorded / on failure.
+    Returns a dict ``{"matrix_cpu", "shadow_matrix_cpu", "layer_numbers",
+    "summaries"}`` on success, or ``None`` if nothing was recorded / on failure.
+    The progressive curriculum consumes this result directly.
     """
     global _active
     try:
@@ -361,6 +390,9 @@ def finalize_and_log(
             # If PP>1 is introduced later, ranks with no local MoE layers
             # would skip the collective and hang peers — revisit this guard.
             return None
+        shadow_matrix = _assemble_accumulator_matrix(_shadow_accumulator)
+        if shadow_matrix is None or shadow_matrix.shape != matrix.shape:
+            raise RuntimeError("shadow routing counts are missing or mis-shaped")
 
         # All-reduce across DP + CP. TP ranks see identical routing_maps
         # (router weight is replicated under TP), so TP reduce would double.
@@ -372,9 +404,11 @@ def finalize_and_log(
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
         # matrix is on GPU; all_reduce operates in-place there.
         dist.all_reduce(matrix, group=dp_cp_group, op=dist.ReduceOp.SUM)
+        dist.all_reduce(shadow_matrix, group=dp_cp_group, op=dist.ReduceOp.SUM)
 
         # Move to CPU for save + summary math. Saves on one rank only.
         matrix_cpu = matrix.to(torch.int64).cpu()
+        shadow_matrix_cpu = shadow_matrix.to(torch.int64).cpu()
         layer_numbers = sorted(_accumulator.keys())
 
         summaries = _compute_summaries(matrix_cpu)
@@ -389,6 +423,7 @@ def finalize_and_log(
             payload = {
                 "iteration": int(iteration),
                 "tokens_per_expert": matrix_cpu,  # [L, E] int64
+                "shadow_tokens_per_expert": shadow_matrix_cpu,
                 "summaries": summaries,
             }
             # Use default serializer; the file is tiny.
@@ -400,6 +435,7 @@ def finalize_and_log(
 
         return {
             "matrix_cpu": matrix_cpu,
+            "shadow_matrix_cpu": shadow_matrix_cpu,
             "layer_numbers": layer_numbers,
             "summaries": summaries,
         }

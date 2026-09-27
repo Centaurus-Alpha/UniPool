@@ -2,7 +2,7 @@
 
 import logging
 from contextlib import contextmanager
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 
@@ -465,6 +465,40 @@ class DistributedDataParallel(_BaseDataParallel):
                     self.param_to_bucket_group[param].register_grad_ready(param)
 
         return hook
+
+    def set_progressive_grad_use_counts(
+        self, use_counts: Optional[Dict[torch.nn.Parameter, int]]
+    ) -> None:
+        """Install progressive-curriculum expected grad-hook firing counts.
+
+        Narrow API for --moe-progressive-overlap-grad-reduce: the curriculum's
+        mask-install path derives, from the installed compact-dispatch
+        signatures, how many AccumulateGrad-hook firings each shared-pool
+        Parameter produces per iteration (0 for experts outside the union of
+        every layer's installed hard mask; k for experts bound into k
+        activation-recompute regions) and hands the mapping here. Each bucket
+        group keeps the slice relevant to its own params; counts take effect
+        at the next ``zero_grad_buffer()``. Passing ``None`` restores stock
+        one-firing-per-param accounting on every group (same semantics as the
+        per-group method). Must be called on every rank with identical
+        structural content (masks are replicated) and only between steps —
+        never during backward.
+        """
+        if use_counts is not None:
+            for param, count in use_counts.items():
+                if param not in self.param_to_bucket_group:
+                    raise RuntimeError(
+                        "progressive overlap grad reduce received a Parameter "
+                        "that is not managed by this DistributedDataParallel "
+                        "instance"
+                    )
+                if int(count) < 0:
+                    raise RuntimeError(
+                        "progressive overlap grad reduce received a negative "
+                        "expected firing count"
+                    )
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            bucket_group.set_progressive_grad_use_counts(use_counts)
 
     @contextmanager
     def no_sync(self):

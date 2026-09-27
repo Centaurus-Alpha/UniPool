@@ -154,6 +154,30 @@ class _ParamAndGradBucketGroup:
 
         self.next_param_gather_bucket_group = None
 
+        # Progressive curriculum mask-aware overlap (--moe-progressive-overlap-grad-reduce):
+        # expected per-iteration AccumulateGrad-hook firing counts for shared
+        # expert-pool Parameters, keyed by Parameter. A count of 0 marks a
+        # Parameter that is structurally excluded from every layer's installed
+        # compact view (its main_grad region stays zero all step); a count of
+        # k > 1 marks a Parameter bound into k activation-recompute regions,
+        # whose gradient is final only after its k-th firing. None (default)
+        # keeps stock one-firing-per-param accounting. Must be initialized
+        # before the reset() call below.
+        self._progressive_grad_use_counts: Optional[Dict[torch.nn.Parameter, int]] = None
+        self._progressive_use_counts_seen: Dict[torch.nn.Parameter, int] = {}
+        # True iff EVERY param of this group has an expected count of 0 (so no
+        # autograd hook will ever dispatch the reduce). Derived once at
+        # set-time; finish_grad_sync uses it — together with the explicit
+        # per-step dispatched flag below — instead of inferring dispatch state
+        # from params_with_grad fullness (which is also full after a normal
+        # completed step and would re-dispatch on a second finish call).
+        self._progressive_group_fully_inactive: bool = False
+        self._progressive_fully_inactive_dispatched: bool = False
+        # Identity of the last table object pushed via
+        # set_progressive_grad_use_counts, enabling the per-step re-push to
+        # skip re-derivation when the curriculum's cached table is unchanged.
+        self._progressive_source_table: Optional[Dict[torch.nn.Parameter, int]] = None
+
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_distributed_optimizer_instance_group = None
             self.communication_stream = None
@@ -178,11 +202,81 @@ class _ParamAndGradBucketGroup:
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
 
+    def set_progressive_grad_use_counts(
+        self, use_counts: Optional[Dict[torch.nn.Parameter, int]]
+    ) -> None:
+        """Install expected grad-hook firing counts (progressive curriculum).
+
+        ``use_counts`` maps shared-pool Parameters to the number of
+        AccumulateGrad-hook firings expected per training iteration on the
+        last microbatch; 0 marks a structurally-inactive Parameter (outside
+        the union of every layer's installed compact mask) that will be
+        seeded ready-with-zero-grad by :meth:`reset`. Parameters absent from
+        the mapping keep stock one-firing accounting. Passing ``None``
+        restores stock accounting entirely.
+
+        Must only be called OUTSIDE forward/backward (the curriculum calls it
+        from the pre-step mask-install path); the new counts take effect at
+        the next :meth:`reset` (i.e. the next ``zero_grad_buffer()``), which
+        always runs between the pre-step install and that step's backward.
+        """
+        if self.grad_reduce_handle is not None:
+            raise RuntimeError(
+                "progressive grad-use counts must not change while a reduce is in flight"
+            )
+        if use_counts is None:
+            self._progressive_grad_use_counts = None
+            self._progressive_group_fully_inactive = False
+            self._progressive_source_table = None
+        elif use_counts is self._progressive_source_table:
+            # Identity fast path: the curriculum re-pushes the (cached) table
+            # every pre-step so a rebuilt DDP wrapper can never run with stale
+            # accounting (its fresh groups start with _progressive_source_table
+            # = None and take the full path below). When the table OBJECT is
+            # unchanged there is nothing to re-derive; seen-counters are still
+            # cleared so the per-step reset contract is identical.
+            pass
+        else:
+            if self.ddp_config.num_distributed_optimizer_instances != 1:
+                raise RuntimeError(
+                    "progressive grad-use counts are only supported with a single "
+                    "distributed-optimizer instance"
+                )
+            relevant = {
+                param: int(count)
+                for param, count in use_counts.items()
+                if param in self.params
+            }
+            self._progressive_grad_use_counts = relevant
+            self._progressive_group_fully_inactive = (
+                bool(relevant)
+                and set(relevant) == self.params
+                and all(count == 0 for count in relevant.values())
+            )
+            self._progressive_source_table = use_counts
+        self._progressive_use_counts_seen = {}
+
     def reset(self):
         """
         Reset metadata in bucket group in preparation for the next iteration of training.
+
+        With progressive grad-use counts installed, Parameters expecting 0
+        firings (structurally inactive: no layer's compact view binds them, so
+        no autograd event will ever arrive) are pre-seeded into
+        ``params_with_grad``. Their ``main_grad`` regions were just zeroed by
+        ``zero_grad_buffer()`` and are never written during the step, so the
+        reduced values are identical to the non-overlapped full reduce.
         """
-        self.params_with_grad = set()
+        if self._progressive_grad_use_counts:
+            self.params_with_grad = {
+                param
+                for param, count in self._progressive_grad_use_counts.items()
+                if count == 0
+            }
+            self._progressive_use_counts_seen = {}
+        else:
+            self.params_with_grad = set()
+        self._progressive_fully_inactive_dispatched = False
         self.is_last_microbatch = True
 
     def check_grads(self, check_for_nan_or_inf, check_for_large):
@@ -485,6 +579,23 @@ class _ParamAndGradBucketGroup:
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync()
             return
+        # Progressive curriculum: a bucket group whose params are ALL structurally
+        # inactive (every one seeded ready-with-zero-grad by reset()) never
+        # receives a register_grad_ready() call, so no reduce was dispatched.
+        # Dispatch it now — the grad regions are still the zeros written by
+        # zero_grad_buffer(), so the reduced values are identical to the
+        # non-overlapped path. Gated on the EXPLICIT set-time marker plus a
+        # per-step dispatched flag (cleared in reset()), never inferred from
+        # params_with_grad fullness: a normally-completed group is also full
+        # with a None handle after its wait, and inferring from that state
+        # would double-reduce its gradients on a second finish call.
+        if (
+            self._progressive_group_fully_inactive
+            and not self._progressive_fully_inactive_dispatched
+            and self.grad_reduce_handle is None
+        ):
+            self.start_grad_sync()
+            self._progressive_fully_inactive_dispatched = True
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
@@ -504,10 +615,49 @@ class _ParamAndGradBucketGroup:
         When the number of microbatches is greater than 1, we only want to register
         grads as ready when processing the last microbatch and ddp_config.overlap_grad_reduce
         is True.
+
+        With progressive grad-use counts installed
+        (:meth:`set_progressive_grad_use_counts`), a counted param only
+        registers on its LAST expected firing of the last microbatch — its
+        gradient is final only once every recompute region binding it has run
+        backward — and any firing of a count-0 (structurally inactive) param
+        or beyond the expected count fails fast: both mean the installed
+        counts disagree with the model's real autograd structure, which would
+        otherwise silently drop gradients by reducing a bucket early.
         """
         assert (
             self.ddp_config.overlap_grad_reduce
         ), "register_grad_ready() should only be called when overlap_grad_reduce is True"
+        use_counts = self._progressive_grad_use_counts
+        if use_counts is not None:
+            expected = use_counts.get(param)
+            if expected is not None:
+                if expected == 0:
+                    # Checked on EVERY microbatch (before the last-microbatch
+                    # gate): a structurally-inactive param must never receive
+                    # an autograd event.
+                    raise RuntimeError(
+                        "progressive overlap grad reduce: a Parameter declared "
+                        "structurally inactive (expected 0 grad firings) "
+                        "received a gradient event; the installed inactive set "
+                        "is stale or too large, which would silently drop "
+                        "gradients"
+                    )
+                if self.is_last_microbatch:
+                    seen = self._progressive_use_counts_seen.get(param, 0) + 1
+                    self._progressive_use_counts_seen[param] = seen
+                    if seen > expected:
+                        raise RuntimeError(
+                            f"progressive overlap grad reduce: Parameter fired "
+                            f"{seen} gradient events but only {expected} were "
+                            "expected; the installed firing counts undercount "
+                            "the model's recompute regions, which would "
+                            "silently drop gradients"
+                        )
+                    if seen < expected:
+                        # Gradient not final yet: later recompute regions still
+                        # accumulate into main_grad. Do not register.
+                        return
         if self.is_last_microbatch:
             assert param in self.param_to_bucket, "Param is not in the bucket group"
             if param in self.params_with_grad:

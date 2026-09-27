@@ -15,7 +15,7 @@ authors:
     family-names: Wu
   - given-names: Guoxuan
     family-names: Chen
-  - given-names: Xintong
+  - given-names: Xingtong
     family-names: Yu
   - given-names: Yichun
     family-names: Yin
@@ -23,7 +23,7 @@ authors:
     family-names: Cheng
 preferred-citation:
   type: article
-  title: "UniPool: A Globally Shared Expert Pool for Mixture-of-Experts"
+  title: "UniPool: Learning Expert-to-Layer Ownership from Brief Global Access"
   year: 2026
   url: "https://arxiv.org/abs/2605.06665"
   identifiers:
@@ -41,7 +41,7 @@ preferred-citation:
       family-names: Wu
     - given-names: Guoxuan
       family-names: Chen
-    - given-names: Xintong
+    - given-names: Xingtong
       family-names: Yu
     - given-names: Yichun
       family-names: Yin

@@ -370,21 +370,33 @@ class PoolAuxLossAccumulator:
 
     def accumulate_and_compute_loss(
         self,
-        scores_for_aux_loss: torch.Tensor,
+        scores_for_aux_loss: Optional[torch.Tensor],
         tokens_per_expert: torch.Tensor,
         total_num_tokens: int,
+        *,
+        aggregated_probs: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         """Accumulate this layer's routing stats and return its pool loss contribution.
 
         Args:
             scores_for_aux_loss: [num_tokens, num_experts] soft routing probs (with grad).
+                May be None iff ``aggregated_probs`` is supplied.
             tokens_per_expert: [num_experts] TP/CP-reduced token counts (detached).
             total_num_tokens: Global token count for this micro-batch.
+            aggregated_probs: optional pre-reduced [num_experts] column sums of the
+                soft routing probs (with grad), used instead of
+                ``scores_for_aux_loss.sum(dim=0)``. The progressive compact router
+                tail reduces over its visible columns only and scatters the sums
+                back to pool space, so it has no [num_tokens, num_experts] matrix.
 
         Returns:
             Per-layer pool loss (scalar tensor with grad), or None during the first
             micro-batch when global_tokens_per_expert has not been initialized yet.
         """
+        if (scores_for_aux_loss is None) == (aggregated_probs is None):
+            raise ValueError(
+                "pool aux loss requires exactly one of scores_for_aux_loss or aggregated_probs"
+            )
         # Accumulate f for updating global_tokens_per_expert at end of micro-batch.
         self._current_tpe_sum.add_(tokens_per_expert.detach())
         self._current_count += 1
@@ -395,7 +407,8 @@ class PoolAuxLossAccumulator:
             #   loss_l = coeff * E * dot(global_f, P_l) / L
             # where global_f = global_tpe / (T * topk), P_l = agg_probs_l / T
             # => loss_l = coeff * E * sum(global_tpe * agg_probs) / (topk * T^2 * L)
-            aggregated_probs = scores_for_aux_loss.sum(dim=0)
+            if aggregated_probs is None:
+                aggregated_probs = scores_for_aux_loss.sum(dim=0)
             T = total_num_tokens
             L = self.num_moe_layers
             # Clone to avoid in-place modification conflict when the global state

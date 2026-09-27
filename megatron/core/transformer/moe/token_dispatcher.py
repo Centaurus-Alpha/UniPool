@@ -414,6 +414,15 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.num_local_experts, -1
         ).T.ravel()
 
+        # Progressive curriculum compact dispatch: when set (by
+        # MoELayer._progressive_compact_apply), the routing_map/probs arriving
+        # here were column-gathered to the layer's visible expert set, so all
+        # expert-space metadata in this dispatcher is compact-width instead of
+        # num_experts wide. None (default) keeps every path unchanged. Only ever
+        # set on the validated EP=TP=1 dropless non-fused topology
+        # (progressive_curriculum.validate_progressive_args).
+        self._progressive_compact_num_experts: Optional[int] = None
+
         # Token drop and padding.
         # Drop and pad the input to capacity.
         self.drop_and_pad = self.config.moe_pad_expert_input_to_capacity
@@ -563,16 +572,38 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # to get the `input_splits` and `output_splits` CPU values.
             self._maybe_update_cuda_sync_point("before_ep_alltoall")
         else:
-            num_global_tokens_per_local_expert = num_local_tokens_per_expert.reshape(
-                self.num_experts
-            )
+            compact_width = self._progressive_compact_num_experts
+            if compact_width is not None:
+                # Progressive compact dispatch (EP=TP=1 only): routing_map columns
+                # were gathered to the visible expert set, so the expert axis is
+                # compact-width here.
+                if int(routing_map.shape[1]) != int(compact_width):
+                    raise RuntimeError(
+                        f"compact dispatch expected a routing_map with {compact_width} "
+                        f"expert columns, got {int(routing_map.shape[1])}"
+                    )
+                num_global_tokens_per_local_expert = num_local_tokens_per_expert.reshape(
+                    compact_width
+                )
+            else:
+                num_global_tokens_per_local_expert = num_local_tokens_per_expert.reshape(
+                    self.num_experts
+                )
             num_tokens_per_local_expert = num_local_tokens_per_expert
 
             # A synchronization is needed before the returns
             # to get the `num_tokens_per_local_expert` CPU value.
             self._maybe_update_cuda_sync_point("before_finish")
 
-        if self.num_local_experts > 1:
+        if self._progressive_compact_num_experts is not None:
+            # Progressive compact dispatch: with EP=TP=1 permutation 2 is an identity
+            # chunk sort (sort_input_by_local_experts == arange), so it is skipped in
+            # dispatch_postprocess/combine_preprocess and only the compact-width
+            # metadata tensor is kept.
+            self.num_global_tokens_per_local_expert = num_global_tokens_per_local_expert.view(
+                1, -1
+            )
+        elif self.num_local_experts > 1:
             # [tp_size * ep_size, num_local_experts]. Represents the number of tokens sent
             # to each local expert by all ranks.
             self.num_global_tokens_per_local_expert = num_global_tokens_per_local_expert.view(
@@ -704,7 +735,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_permutation_2", self.tokens_per_expert
         )
-        if self.num_local_experts > 1:
+        if self._progressive_compact_num_experts is not None:
+            # Progressive compact dispatch: EP=TP=1 makes this chunk sort the identity
+            # permutation, so skipping it is bitwise equivalent.
+            pass
+        elif self.num_local_experts > 1:
             if self.drop_and_pad:
                 global_input_tokens = (
                     global_input_tokens.view(
@@ -750,7 +785,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         parallel dimension.
         """
         # Unpermutation 2: Unsort tokens by local expert.
-        if self.num_local_experts > 1:
+        if self._progressive_compact_num_experts is not None:
+            # Progressive compact dispatch: identity unsort at EP=TP=1, mirroring the
+            # skipped permutation-2 sort in dispatch_postprocess.
+            pass
+        elif self.num_local_experts > 1:
             if self.drop_and_pad:
                 hidden_states = (
                     hidden_states.view(

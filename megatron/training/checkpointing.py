@@ -32,6 +32,7 @@ from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.utils import get_pg_rank, get_pg_size
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.transformer.moe import curriculum as moe_curriculum
 from megatron.core.utils import get_torch_version, is_torch_min_version
 
 from ..core.dist_checkpointing.serialization import get_default_save_sharded_strategy
@@ -887,6 +888,11 @@ def generate_state_dict(
     # Rerun state
     if rerun_state:
         state_dict['rerun_state_machine'] = rerun_state
+
+    # Progressive curriculum lifecycle state (partition masks, anneal window,
+    # EMA routing history). A None payload means no validation was observed yet.
+    if getattr(args, 'moe_progressive_curriculum', False):
+        state_dict['progressive_curriculum'] = moe_curriculum.progressive_checkpoint_payload()
 
     # RNG states.
     if not args.no_save_rng and rng_state:
@@ -1864,6 +1870,15 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 if not log_printed:
                     print_rank_0(">>> Inserting 'default_config' field into optimizer.param_groups...")
                 log_printed = True
+
+    # Hand the checkpoint-owned curriculum state to the model-aware restore in
+    # setup_model_and_optimizer. An absent key stages (False, None), so a resume
+    # at iteration > 0 fails closed instead of re-exploring the full pool.
+    if getattr(args, 'moe_progressive_curriculum', False):
+        moe_curriculum.stage_progressive_checkpoint_payload(
+            present='progressive_curriculum' in state_dict,
+            payload=state_dict.get('progressive_curriculum'),
+        )
 
     return iteration, num_floating_point_operations_so_far
 

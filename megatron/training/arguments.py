@@ -23,6 +23,10 @@ from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
+from megatron.core.transformer.moe.progressive_curriculum import (
+    add_progressive_curriculum_args,
+    validate_progressive_args,
+)
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
     MLPConfig,
@@ -1114,6 +1118,8 @@ def validate_args(args, defaults={}):
 
     # Expert pool sharing check
     validate_moe_expert_pool_args(args)
+    # Progressive curriculum check (reads nothing when the curriculum is off).
+    validate_progressive_args(args)
 
     if getattr(args, 'moe_expert_pool_size', 1) > 1:
         assert args.num_experts is not None, \
@@ -3304,6 +3310,8 @@ def _add_moe_args(parser):
                        help='Coefficient for pool-level auxiliary load balancing loss. Balances '
                        'expert usage across all layers sharing the same expert pool, instead of '
                        'per-layer balancing. Requires --moe-expert-pool-mode hyper.')
+    # Progressive curriculum on the global hyper pool.
+    add_progressive_curriculum_args(group)
     # Granular Expert Arguments
     group.add_argument('--moe-granularity', type=int, default=1,
                        help='Granularity of fine-grained MoE. The default is 1.')

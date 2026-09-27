@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -19,6 +19,11 @@ from megatron.core.transformer.moe.moe_utils import (
     get_num_moe_layers,
     is_generalized_expert_pool_mode,
     maybe_skip_or_early_return_by_cudagraph,
+)
+from megatron.core.transformer.moe.experts import TEGroupedMLP
+from megatron.core.transformer.moe.progressive_curriculum import (
+    CompactDispatchPlan,
+    build_compact_dispatch_plan,
 )
 from megatron.core.transformer.moe.router import TopKRouter, ReLURouter, NormRouter, HashRouter
 from megatron.core.transformer.moe.token_dispatcher import (
@@ -164,6 +169,15 @@ class MoELayer(BaseMoELayer):
         self._pool_slot_refs = []
         self._pool_slot_mask = None
 
+        # Progressive curriculum compact dispatch state. None (default) keeps every
+        # code path unchanged. Once the partition is locked and
+        # --moe-progressive-compact-dispatch is on, the curriculum runtime installs a
+        # plain dict here via _progressive_compact_install(). Deliberately a dict
+        # (never an nn.Module attribute) so the compact expert view is invisible to
+        # named_parameters()/state_dict()/DDP: its weights ARE the shared pool
+        # Parameters, which are already registered once through self.experts.
+        self._progressive_compact_state: Optional[Dict[str, Any]] = None
+
         self.moe_layer_recompute = (
             config.recompute_granularity == 'selective' and "moe" in config.recompute_modules
         )
@@ -276,6 +290,184 @@ class MoELayer(BaseMoELayer):
             )
         self.router.set_layer_number(layer_number)
 
+    # ------------------------------------------------------------------ #
+    # Progressive curriculum: runtime compact dispatch
+    # ------------------------------------------------------------------ #
+
+    def _progressive_compact_install(self, hard_mask: Optional[torch.Tensor]) -> None:
+        """Install or refresh this layer's compact dispatch state.
+
+        Called by ``curriculum.update_progressive_runtime`` whenever the
+        installed curriculum state changes. ``None`` means the partition is not
+        locked yet: compaction stays inactive and every forward runs the stock
+        full-pool path. The compact view is rebuilt only when the visible set
+        actually changes, so repeated calls are cheap cache hits.
+        """
+        if hard_mask is None:
+            if self._progressive_compact_state is not None:
+                raise RuntimeError(
+                    "progressive compact dispatch cannot deactivate: the partition "
+                    "never unlocks once installed"
+                )
+            return
+        plan = build_compact_dispatch_plan(hard_mask)
+        current = self._progressive_compact_state
+        if current is not None and current["signature"] == plan.signature:
+            return
+        if current is not None:
+            raise RuntimeError("the progressive partition cannot change once locked")
+        self._progressive_compact_state = self._progressive_compact_build(plan)
+
+    @staticmethod
+    def _progressive_bind_pool_weights(
+        compact_linear: torch.nn.Module,
+        pool_linear: torch.nn.Module,
+        visible: Tuple[int, ...],
+    ) -> None:
+        """Re-register the compact view's per-gemm weights as the pool Parameters.
+
+        TE ``GroupedLinear`` stores one Parameter per gemm (``weight0..N``).
+        Re-registering ``weight{j}`` as the pool's ``weight{visible[j]}`` makes
+        the compact GEMM consume THE SAME Parameter storage as the pool: the
+        autograd graph terminates at the pool leaves and TE's fused wgrad
+        accumulation writes into the pool params' ``.main_grad``, exactly as when
+        the shared pool module itself is called. No weight copies are made.
+        """
+        for compact_idx, pool_idx in enumerate(visible):
+            pool_name = f"weight{int(pool_idx)}"
+            compact_name = f"weight{compact_idx}"
+            pool_param = getattr(pool_linear, pool_name, None)
+            if not isinstance(pool_param, torch.nn.Parameter):
+                raise RuntimeError(
+                    f"pool grouped linear has no per-gemm Parameter {pool_name!r}; "
+                    "compact dispatch requires TE GroupedLinear per-gemm weights"
+                )
+            compact_param = getattr(compact_linear, compact_name, None)
+            if not isinstance(compact_param, torch.nn.Parameter):
+                raise RuntimeError(
+                    f"compact grouped linear has no per-gemm Parameter {compact_name!r}"
+                )
+            if compact_param.shape != pool_param.shape:
+                raise RuntimeError(
+                    f"compact weight shape {tuple(compact_param.shape)} does not match "
+                    f"pool weight shape {tuple(pool_param.shape)} for expert {pool_idx}"
+                )
+            setattr(compact_linear, compact_name, pool_param)
+        # Some TE versions cache a per-module weight list; refresh it so forward
+        # reads the re-registered pool Parameters.
+        if hasattr(compact_linear, "weight_tensors"):
+            compact_linear.weight_tensors = [
+                getattr(compact_linear, f"weight{i}") for i in range(len(visible))
+            ]
+        for compact_idx, pool_idx in enumerate(visible):
+            if getattr(compact_linear, f"weight{compact_idx}") is not getattr(
+                pool_linear, f"weight{int(pool_idx)}"
+            ):
+                raise RuntimeError("compact grouped linear failed to bind the shared pool Parameter")
+
+    @staticmethod
+    def _progressive_compact_state_from_plan(
+        plan: CompactDispatchPlan,
+        compact_experts: Any,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Any]:
+        """Materialize the runtime compact state from a plan (pure, CPU-safe)."""
+        visible_index_device = (
+            plan.visible_indices.clone()
+            if device is None
+            else plan.visible_indices.to(device=device)
+        )
+        return {
+            "signature": plan.signature,
+            "num_visible": plan.num_visible,
+            "visible_index": plan.visible_indices,
+            "visible_index_device": visible_index_device,
+            "lut": plan.lut,
+            "experts": compact_experts,
+        }
+
+    def _progressive_compact_build(self, plan: CompactDispatchPlan) -> Dict[str, Any]:
+        """Build a K-gemm TEGroupedMLP view over the shared pool Parameters."""
+        if not isinstance(self.token_dispatcher, MoEAlltoAllTokenDispatcher):
+            raise RuntimeError(
+                "progressive compact dispatch requires the alltoall token dispatcher "
+                f"(got {type(self.token_dispatcher).__name__})"
+            )
+        pool = self.experts
+        if not isinstance(pool, TEGroupedMLP):
+            raise RuntimeError(
+                "progressive compact dispatch supports only TEGroupedMLP experts "
+                f"(got {type(pool).__name__})"
+            )
+        if plan.num_experts != int(self.num_local_experts):
+            raise RuntimeError(
+                f"compact plan width {plan.num_experts} does not match the pool "
+                f"width {self.num_local_experts}"
+            )
+        # Shallow copy only: a deepcopy would disconnect shared config tensors.
+        # perform_initialization=False makes TE skip init_method, so no RNG state
+        # is consumed mid-training; the placeholder weights are replaced by the
+        # shared pool Parameters below and freed.
+        build_config = copy.copy(self.config)
+        build_config.perform_initialization = False
+        compact_experts = TEGroupedMLP(
+            plan.num_visible,
+            build_config,
+            self.submodules.experts.submodules,
+            pg_collection=self._pg_collection,
+        )
+        self._progressive_bind_pool_weights(
+            compact_experts.linear_fc1, pool.linear_fc1, plan.signature
+        )
+        self._progressive_bind_pool_weights(
+            compact_experts.linear_fc2, pool.linear_fc2, plan.signature
+        )
+        device = None
+        for param in pool.parameters():
+            device = param.device
+            break
+        return self._progressive_compact_state_from_plan(plan, compact_experts, device=device)
+
+    def _progressive_compact_apply(
+        self, probs: torch.Tensor, routing_map: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gather router outputs from pool columns into the layer's compact space.
+
+        Runs between the router (whose outputs, aux losses and diagnostics stay
+        in pool space) and the dispatcher. The hard mask guarantees the router
+        never selects an invisible expert, so the dropped columns are
+        all-False/all-zero and the permuted token rows, probs, and combine
+        outputs are bit-identical to the full-pool path. Pure lookups only (plus
+        tagging the dispatcher with the deterministic compact width), so the
+        path replays identically under activation recompute.
+
+        With ``--moe-progressive-compact-router`` the NormRouter tail already
+        emitted ``[num_tokens, K]`` tensors in this layer's compact column
+        order, so they pass through untouched.
+        """
+        state = self._progressive_compact_state
+        assert state is not None
+        num_visible = int(state["num_visible"])
+        self.token_dispatcher._progressive_compact_num_experts = num_visible
+        if probs.shape[1] != routing_map.shape[1]:
+            raise RuntimeError(
+                f"compact dispatch got mismatched router widths: probs "
+                f"{probs.shape[1]} vs routing_map {routing_map.shape[1]}"
+            )
+        if routing_map.shape[1] == num_visible:
+            return probs, routing_map
+        num_experts = int(state["lut"].numel())
+        if routing_map.shape[1] != num_experts:
+            raise RuntimeError(
+                f"compact dispatch expected router outputs of width {num_experts} "
+                f"(pool) or {num_visible} (compact), got {routing_map.shape[1]}"
+            )
+        visible = state["visible_index_device"]
+        if visible.device != probs.device:
+            visible = state["visible_index"].to(device=probs.device)
+            state["visible_index_device"] = visible
+        return probs.index_select(1, visible), routing_map.index_select(1, visible)
+
     @maybe_skip_or_early_return_by_cudagraph("route")
     def route(self, hidden_states: torch.Tensor):
         """Compute token routing for preprocessing.
@@ -358,7 +550,32 @@ class MoELayer(BaseMoELayer):
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
 
-        if self._pool_slot_refs:
+        if self._progressive_compact_state is not None:
+            # Progressive compact dispatch: run the K-gemm view over the shared
+            # pool Parameters instead of iterating all pool groups.
+            compact_state = self._progressive_compact_state
+            if int(tokens_per_expert.numel()) != int(compact_state["num_visible"]):
+                raise RuntimeError(
+                    f"compact dispatch expected {compact_state['num_visible']} expert "
+                    f"groups, got {int(tokens_per_expert.numel())}"
+                )
+            # Routed-token conservation guard: dropping a ROUTED expert's column
+            # would silently shrink the permuted rows. tokens_per_expert is
+            # host-resident here and num_out_tokens is a Python int on the
+            # dropless path, so this check is free.
+            expected_routed = getattr(self.token_dispatcher, "num_out_tokens", None)
+            if isinstance(expected_routed, int) and int(tokens_per_expert.sum()) != int(
+                expected_routed
+            ):
+                raise RuntimeError(
+                    f"compact dispatch dropped routed tokens: tokens_per_expert sums to "
+                    f"{int(tokens_per_expert.sum())} but the router emitted "
+                    f"{int(expected_routed)} routed slots"
+                )
+            expert_output, mlp_bias = compact_state["experts"](
+                dispatched_input, tokens_per_expert, permuted_probs
+            )
+        elif self._pool_slot_refs:
             expert_output, mlp_bias = self._pooled_expert_forward(
                 dispatched_input, tokens_per_expert, permuted_probs
             )
@@ -551,6 +768,10 @@ class MoELayer(BaseMoELayer):
             try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
                 probs, routing_map = self.route(hidden_states)
+                if self._progressive_compact_state is not None:
+                    # Progressive compact dispatch: translate the router's pool-space
+                    # outputs to the layer's visible set before dispatch.
+                    probs, routing_map = self._progressive_compact_apply(probs, routing_map)
                 hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.

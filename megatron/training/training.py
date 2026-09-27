@@ -49,6 +49,7 @@ except ImportError:
 
 
 from megatron.core import mpu, tensor_parallel
+from megatron.core.transformer.moe import curriculum as _curriculum
 from megatron.core.transformer.moe import routing_diagnostics as _routing_diag
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
@@ -1299,6 +1300,12 @@ def setup_model_and_optimizer(
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
 
+    # Progressive curriculum: re-install the partition state embedded in the
+    # checkpoint. A resume at iteration > 0 without it fails here, before any
+    # training step could run on an unrestricted pool.
+    if _curriculum.is_enabled(args):
+        _curriculum.try_restore(list(model), current_iteration=args.iteration, args=args)
+
     # get model without FP16 and/or DDP wrappers
     if (
         args.iteration == 0
@@ -2466,6 +2473,12 @@ def train(
 
 
         args.curr_iteration = iteration
+        # Progressive curriculum: reconstruct the router anneal/entropy controls
+        # and install the partition mask (if locked) before this step's forward.
+        if _curriculum.is_enabled(args):
+            _curriculum.update_progressive_runtime(
+                iteration=iteration, args=args, model_modules=list(model)
+            )
         # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
         # It is similar to a PPO epoch.
 
@@ -2913,7 +2926,7 @@ def evaluate(
 
     # Finalize routing diagnostics (all-reduce + save + scalar logging).
     # Must be called on every rank (collective). Fail-safe internally.
-    _routing_diag.finalize_and_log(
+    diag_result = _routing_diag.finalize_and_log(
         iteration=iteration,
         save_dir=args.save,
         writer=get_tensorboard_writer(),
@@ -2923,6 +2936,28 @@ def evaluate(
     for key in total_loss_dict:
         numerator, denominator = total_loss_dict[key]
         total_loss_dict[key] = numerator / denominator
+
+    # Progressive curriculum: freeze / lock the per-layer partition on its
+    # fixed validation boundaries and enforce the validation-loss fail-stop.
+    if _curriculum.is_enabled(args):
+        progressive_val_loss = None
+        lm_loss = total_loss_dict.get('lm loss')
+        if lm_loss is not None and torch.is_tensor(lm_loss) and lm_loss.numel() == 1:
+            progressive_val_loss = float(lm_loss.item())
+        _curriculum.maybe_advance(
+            iteration=iteration,
+            args=args,
+            accumulator_cpu=None if diag_result is None else diag_result["matrix_cpu"],
+            shadow_accumulator_cpu=(
+                None if diag_result is None else diag_result["shadow_matrix_cpu"]
+            ),
+            layer_numbers=None if diag_result is None else diag_result["layer_numbers"],
+            model_modules=list(model),
+            val_loss=progressive_val_loss,
+            save_dir=args.save,
+            writer=get_tensorboard_writer(),
+            wandb_writer=get_wandb_writer(),
+        )
 
     timers('evaluate').stop()
     timers.log(['evaluate'])
